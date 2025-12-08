@@ -10,18 +10,14 @@ const DEVICE_ID = 'eba98daf700c720018hrla';
 const TUYA_BASE_URL = 'https://openapi.tuyaus.com';
 
 // --- FIREBASE SETUP ---
-// We check if we are on Render (Cloud) or Local (Your PC)
 let serviceAccount;
-
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  // If running on Render, parse the environment variable string
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 } else {
-  // If running locally, look for the file
   try {
     serviceAccount = require('./service-account.json');
   } catch (e) {
-    console.error("ERROR: Could not find 'service-account.json'. Make sure you downloaded it from Firebase!");
+    console.error("ERROR: Could not find 'service-account.json'");
     process.exit(1);
   }
 }
@@ -35,7 +31,6 @@ const db = admin.database();
 let accessToken = null;
 
 // --- TUYA HELPERS ---
-
 function calculateSign(content, secret) {
   return crypto.createHmac('sha256', secret).update(content, 'utf8').digest('hex').toUpperCase();
 }
@@ -61,11 +56,9 @@ async function getAccessToken() {
   return false;
 }
 
+// --- MAIN LOOP ---
 async function fetchAndSave() {
-  console.log("Fetching data from Tuya...");
-  if (!accessToken) {
-    await getAccessToken();
-  }
+  if (!accessToken) await getAccessToken();
 
   const timestamp = Date.now().toString();
   const path = `/v1.0/devices/${DEVICE_ID}/status`;
@@ -89,36 +82,80 @@ async function fetchAndSave() {
         if (item.code === 'switch_1') data.is_on = item.value;
       });
 
-      // Add timestamp
       data.timestamp = admin.database.ServerValue.TIMESTAMP;
-
-      // Save to Firebase
       await db.ref('readings').push().set(data);
-      console.log(`✅ Saved Reading: ${data.power}W | ${data.voltage}V`);
+      console.log(`✅ Reading: ${data.power}W | ${data.is_on ? 'ON' : 'OFF'}`);
+
+      // 🟢 CHECK SCHEDULE
+      await checkSchedule(data.is_on);
+
     } else {
-      console.log('❌ Tuya Error:', res.data.msg);
+      console.log('Tuya Error:', res.data.msg);
       if (res.data.code === 1010) accessToken = null; 
     }
   } catch (e) {
-    console.error('❌ Fetch Error:', e.message);
+    console.error('Fetch Error:', e.message);
     accessToken = null; 
   }
 }
 
-// --- START SERVER ---
+// 🟢 NEW: Check Schedule Logic
+async function checkSchedule(currentStatus) {
+  try {
+    const snapshot = await db.ref('schedule').once('value');
+    const schedule = snapshot.val();
+
+    if (!schedule || !schedule.isEnabled) return;
+
+    // Get current time in User's Timezone (Asia/Kuala_Lumpur)
+    const now = new Date();
+    const timeString = now.toLocaleTimeString('en-US', { 
+      timeZone: 'Asia/Kuala_Lumpur', 
+      hour12: false, 
+      hour: '2-digit', 
+      minute: '2-digit' 
+    });
+
+    // If Current Time == Scheduled Time
+    if (timeString === schedule.time) {
+      // Only execute if the status is DIFFERENT (Don't turn ON if already ON)
+      if (currentStatus !== schedule.action) {
+        console.log(`⏰ SCHEDULE MATCH! Time: ${timeString}. Turning ${schedule.action ? 'ON' : 'OFF'}`);
+        await toggleDevice(schedule.action);
+      }
+    }
+  } catch (e) {
+    console.error("Schedule Error:", e);
+  }
+}
+
+// Toggle Helper
+async function toggleDevice(turnOn) {
+  if (!accessToken) await getAccessToken();
+  const timestamp = Date.now().toString();
+  const path = `/v1.0/devices/${DEVICE_ID}/commands`;
+  const body = { "commands": [{ "code": "switch_1", "value": turnOn }] };
+  const jsonBody = JSON.stringify(body);
+  const contentHash = crypto.createHash('sha256').update(jsonBody).digest('hex');
+  const signStr = `${TUYA_CLIENT_ID}${accessToken}${timestamp}POST\n${contentHash}\n\n${path}`;
+  const sign = calculateSign(signStr, TUYA_SECRET);
+
+  try {
+    await axios.post(`${TUYA_BASE_URL}${path}`, body, {
+      headers: { client_id: TUYA_CLIENT_ID, access_token: accessToken, sign: sign, t: timestamp, sign_method: 'HMAC-SHA256' }
+    });
+    console.log("👉 Command Sent Successfully");
+  } catch (e) {
+    console.error("Command Failed:", e.message);
+  }
+}
+
+// --- SERVER SETUP ---
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-  res.send('Power Monitor Backend is Running');
-});
-
+app.get('/', (req, res) => res.send('Power Monitor Running'));
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  
-  // Run immediately on start
+  console.log(`Server running on port ${PORT}`);
   fetchAndSave(); 
-  
-  // Then run every 60 seconds
   setInterval(fetchAndSave, 60 * 1000); 
 });
