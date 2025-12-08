@@ -86,7 +86,7 @@ async function fetchAndSave() {
       await db.ref('readings').push().set(data);
       console.log(`✅ Reading: ${data.power}W | ${data.is_on ? 'ON' : 'OFF'}`);
 
-      // 🟢 CHECK SCHEDULE
+      // 🟢 NEW: CHECK SCHEDULE
       await checkSchedule(data.is_on);
 
     } else {
@@ -129,7 +129,7 @@ async function checkSchedule(currentStatus) {
   }
 }
 
-// Toggle Helper
+// 🟢 NEW: Toggle Helper
 async function toggleDevice(turnOn) {
   if (!accessToken) await getAccessToken();
   const timestamp = Date.now().toString();
