@@ -84,9 +84,9 @@ async function fetchAndSave() {
 
       data.timestamp = admin.database.ServerValue.TIMESTAMP;
       await db.ref('readings').push().set(data);
-      console.log(`✅ Reading: ${data.power}W | ${data.is_on ? 'ON' : 'OFF'}`);
+      console.log(`✅ ${data.power}W | ${data.is_on ? 'ON' : 'OFF'}`);
 
-      // 🟢 NEW: CHECK SCHEDULE
+      // 🟢 CHECK SCHEDULE (Updated Logic)
       await checkSchedule(data.is_on);
 
     } else {
@@ -99,7 +99,7 @@ async function fetchAndSave() {
   }
 }
 
-// 🟢 NEW: Check Schedule Logic
+// 🟢 NEW: Range & Day Checking Logic
 async function checkSchedule(currentStatus) {
   try {
     const snapshot = await db.ref('schedule').once('value');
@@ -107,29 +107,49 @@ async function checkSchedule(currentStatus) {
 
     if (!schedule || !schedule.isEnabled) return;
 
-    // Get current time in User's Timezone (Asia/Kuala_Lumpur)
+    // 1. Get Current Time & Day in Malaysia Time
     const now = new Date();
-    const timeString = now.toLocaleTimeString('en-US', { 
-      timeZone: 'Asia/Kuala_Lumpur', 
-      hour12: false, 
-      hour: '2-digit', 
-      minute: '2-digit' 
-    });
+    const options = { timeZone: 'Asia/Kuala_Lumpur', hour12: false, hour: '2-digit', minute: '2-digit', weekday: 'short' };
+    
+    // We need strict parsing to separate Time from Day
+    const formatter = new Intl.DateTimeFormat('en-US', { ...options, weekday: 'short' }); // "Mon"
+    const timeFormatter = new Intl.DateTimeFormat('en-US', { ...options, weekday: undefined }); // "14:30"
+    
+    const currentDayStr = formatter.format(now); // e.g., "Mon"
+    const currentTimeStr = timeFormatter.format(now); // e.g., "14:30"
 
-    // If Current Time == Scheduled Time
-    if (timeString === schedule.time) {
-      // Only execute if the status is DIFFERENT (Don't turn ON if already ON)
-      if (currentStatus !== schedule.action) {
-        console.log(`⏰ SCHEDULE MATCH! Time: ${timeString}. Turning ${schedule.action ? 'ON' : 'OFF'}`);
-        await toggleDevice(schedule.action);
+    // 2. Map Day String to Index (0=Sun, 1=Mon ...)
+    const dayMap = { "Sun": 0, "Mon": 1, "Tue": 2, "Wed": 3, "Thu": 4, "Fri": 5, "Sat": 6 };
+    const currentDayIndex = dayMap[currentDayStr];
+
+    // 3. Check if Today is selected in the schedule list
+    // schedule.days is a list of booleans [false, true, true...]
+    if (!schedule.days || !schedule.days[currentDayIndex]) {
+      // Today is NOT selected. Do nothing.
+      return; 
+    }
+
+    // 4. Check Triggers
+    if (currentTimeStr === schedule.start) {
+      // It's Start Time -> Turn ON
+      if (currentStatus === false) {
+        console.log(`⏰ START TIME (${currentTimeStr}) -> Turning ON`);
+        await toggleDevice(true);
+      }
+    } else if (currentTimeStr === schedule.end) {
+      // It's End Time -> Turn OFF
+      if (currentStatus === true) {
+        console.log(`⏰ END TIME (${currentTimeStr}) -> Turning OFF`);
+        await toggleDevice(false);
       }
     }
+
   } catch (e) {
     console.error("Schedule Error:", e);
   }
 }
 
-// 🟢 NEW: Toggle Helper
+// Toggle Helper
 async function toggleDevice(turnOn) {
   if (!accessToken) await getAccessToken();
   const timestamp = Date.now().toString();
@@ -153,7 +173,7 @@ async function toggleDevice(turnOn) {
 // --- SERVER SETUP ---
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Power Monitor Running'));
+app.get('/', (req, res) => res.send('Power Monitor Backend is Running'));
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   fetchAndSave(); 
