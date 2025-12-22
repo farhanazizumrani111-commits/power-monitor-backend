@@ -1,44 +1,59 @@
-// index.js – Power Monitor Backend (Mode A)
-// ----------------------------------------
-// - Polls Tuya smart plug and writes readings to Firebase Realtime DB
-// - Writes /status/current for Flutter to read (single source of truth)
+// ==========================================================
+// index.js — Power Monitor Backend (MODE A)
+// ==========================================================
+// - Polls Tuya smart plug every minute
+// - Saves readings to Firebase Realtime DB
+// - Detects ONLINE / OFFLINE
 // - Enforces schedule from /schedule
-// - Listens to /control/command for manual ON/OFF (from Flutter app)
+// - Listens to /control/command from Flutter
+// ==========================================================
 
 const axios = require('axios');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 
-// 1) Load Firebase service account JSON (DO NOT COMMIT THIS FILE)
-const serviceAccount = require('./serviceAccountKey.json');
+// ----------------------------------------------------------
+// FIREBASE ADMIN (Render-safe, NO local JSON required)
+// ----------------------------------------------------------
+
+let serviceAccount;
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+} else {
+  // Local development fallback ONLY
+  serviceAccount = require('./serviceAccountKey.json');
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL:
+    process.env.FIREBASE_DB_URL ||
     'https://power-monitoring-b3f6d-default-rtdb.asia-southeast1.firebasedatabase.app/',
 });
 
 const db = admin.database();
 
-// -----------------------------------------------------------
+// ----------------------------------------------------------
 // TUYA CONFIG
-// -----------------------------------------------------------
-const clientId = '5urvraenffcq579wss7f';
-const clientSecret = '168f6566bcc74c8f9f050b579e33c13d';
-const deviceId = 'eba98daf700c720018hrla';
-const baseUrl = 'https://openapi.tuyaus.com';
+// ----------------------------------------------------------
+
+const TUYA_CLIENT_ID = '5urvraenffcq579wss7f';
+const TUYA_SECRET = '168f6566bcc74c8f9f050b579e33c13d';
+const DEVICE_ID = 'eba98daf700c720018hrla';
+const TUYA_BASE_URL = 'https://openapi.tuyaus.com';
+
+const LOAD_THRESHOLD_W = 5; // ✅ load detection
 
 let accessToken = null;
-const LOAD_THRESHOLD_W = 5;
+let lastKnownRelay = false;
+let scheduleConfig = null;
 
-// Polling intervals
-const POLL_MS = 10 * 1000; // 10s (full-time monitoring)
-const SCHEDULE_MS = 15 * 1000; // 15s
+// ----------------------------------------------------------
+// HELPERS
+// ----------------------------------------------------------
 
-// -----------------------------------------------------------
-// TUYA SIGNING HELPERS
-// -----------------------------------------------------------
-function calculateSign(content, secret) {
+function sign(content, secret) {
   return crypto
     .createHmac('sha256', secret)
     .update(content, 'utf8')
@@ -46,300 +61,198 @@ function calculateSign(content, secret) {
     .toUpperCase();
 }
 
-async function refreshAccessToken() {
-  const timestamp = Date.now();
-  const emptyBodyHash =
-    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+async function getAccessToken() {
+  const t = Date.now().toString();
+  const path = '/v1.0/token?grant_type=1';
+  const hash = crypto.createHash('sha256').update('').digest('hex');
+  const str = `${TUYA_CLIENT_ID}${t}GET\n${hash}\n\n${path}`;
+  const s = sign(str, TUYA_SECRET);
 
-  const stringToSign =
-    clientId +
-    timestamp +
-    'GET\n' +
-    emptyBodyHash +
-    '\n\n' +
-    '/v1.0/token?grant_type=1';
-
-  const sign = calculateSign(stringToSign, clientSecret);
-
-  const res = await axios.get(`${baseUrl}/v1.0/token?grant_type=1`, {
+  const res = await axios.get(`${TUYA_BASE_URL}${path}`, {
     headers: {
-      client_id: clientId,
-      sign: sign,
-      t: String(timestamp),
+      client_id: TUYA_CLIENT_ID,
+      sign: s,
+      t,
       sign_method: 'HMAC-SHA256',
     },
-    timeout: 10000,
-  });
-
-  if (!res.data.success) throw new Error(`Token error: ${res.data.msg}`);
-
-  accessToken = res.data.result.access_token;
-  console.log('✅ Got Tuya access token');
-  return accessToken;
-}
-
-async function ensureToken() {
-  if (!accessToken) await refreshAccessToken();
-}
-
-// -----------------------------------------------------------
-// TUYA API FUNCTIONS
-// -----------------------------------------------------------
-async function getDeviceStatus() {
-  await ensureToken();
-
-  const timestamp = Date.now();
-  const path = `/v1.0/devices/${deviceId}/status`;
-  const emptyBodyHash =
-    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-
-  const stringToSign =
-    clientId +
-    accessToken +
-    timestamp +
-    'GET\n' +
-    emptyBodyHash +
-    '\n\n' +
-    path;
-
-  const sign = calculateSign(stringToSign, clientSecret);
-
-  const res = await axios.get(`${baseUrl}${path}`, {
-    headers: {
-      client_id: clientId,
-      access_token: accessToken,
-      sign: sign,
-      t: String(timestamp),
-      sign_method: 'HMAC-SHA256',
-    },
-    timeout: 10000,
   });
 
   if (!res.data.success) {
-    // token expired
-    if (res.data.code === '1010' || res.data.code === 1010) {
-      accessToken = null;
-      await ensureToken();
-      return await getDeviceStatus();
-    }
-    throw new Error(res.data.msg || 'Failed to get status');
+    throw new Error(res.data.msg);
   }
 
-  const list = res.data.result || [];
-  let voltage = 0;
-  let current = 0;
-  let power = 0;
-  let isOn = false;
+  accessToken = res.data.result.access_token;
+  console.log('✅ Tuya token OK');
+}
 
-  for (const item of list) {
-    const code = item.code;
-    const value = item.value;
+async function ensureToken() {
+  if (!accessToken) await getAccessToken();
+}
 
-    if (code === 'cur_voltage') voltage = Number(value) / 10.0;
-    if (code === 'cur_current') current = Number(value) / 1000.0;
-    if (code === 'cur_power') power = Number(value) / 10.0;
-    if (code === 'switch_1') isOn = !!value;
+// ----------------------------------------------------------
+// TUYA API
+// ----------------------------------------------------------
+
+async function getDeviceStatus() {
+  await ensureToken();
+
+  const t = Date.now().toString();
+  const path = `/v1.0/devices/${DEVICE_ID}/status`;
+  const hash = crypto.createHash('sha256').update('').digest('hex');
+  const str = `${TUYA_CLIENT_ID}${accessToken}${t}GET\n${hash}\n\n${path}`;
+  const s = sign(str, TUYA_SECRET);
+
+  const res = await axios.get(`${TUYA_BASE_URL}${path}`, {
+    headers: {
+      client_id: TUYA_CLIENT_ID,
+      access_token: accessToken,
+      sign: s,
+      t,
+      sign_method: 'HMAC-SHA256',
+    },
+  });
+
+  if (!res.data.success) {
+    if (res.data.code === 1010) {
+      accessToken = null;
+      return getDeviceStatus();
+    }
+    throw new Error(res.data.msg);
+  }
+
+  let voltage = 0,
+    current = 0,
+    power = 0,
+    isOn = false;
+
+  for (const item of res.data.result) {
+    if (item.code === 'cur_voltage') voltage = item.value / 10;
+    if (item.code === 'cur_current') current = item.value / 1000;
+    if (item.code === 'cur_power') power = item.value / 10;
+    if (item.code === 'switch_1') isOn = item.value;
   }
 
   const loadOn = isOn && power >= LOAD_THRESHOLD_W;
+
   return { voltage, current, power, isOn, loadOn };
 }
 
-async function sendToggleCommand(turnOn, source = 'manual') {
+async function toggleRelay(turnOn, source) {
   await ensureToken();
 
-  const timestamp = Date.now();
-  const path = `/v1.0/devices/${deviceId}/commands`;
-
+  const t = Date.now().toString();
+  const path = `/v1.0/devices/${DEVICE_ID}/commands`;
   const body = { commands: [{ code: 'switch_1', value: !!turnOn }] };
-  const jsonBody = JSON.stringify(body);
+  const json = JSON.stringify(body);
+  const hash = crypto.createHash('sha256').update(json).digest('hex');
+  const str = `${TUYA_CLIENT_ID}${accessToken}${t}POST\n${hash}\n\n${path}`;
+  const s = sign(str, TUYA_SECRET);
 
-  const contentHash = crypto
-    .createHash('sha256')
-    .update(jsonBody, 'utf8')
-    .digest('hex');
-
-  const stringToSign =
-    clientId +
-    accessToken +
-    timestamp +
-    'POST\n' +
-    contentHash +
-    '\n\n' +
-    path;
-
-  const sign = calculateSign(stringToSign, clientSecret);
-
-  const res = await axios.post(`${baseUrl}${path}`, body, {
+  await axios.post(`${TUYA_BASE_URL}${path}`, body, {
     headers: {
-      client_id: clientId,
+      client_id: TUYA_CLIENT_ID,
       access_token: accessToken,
-      sign: sign,
-      t: String(timestamp),
+      sign: s,
+      t,
       sign_method: 'HMAC-SHA256',
       'Content-Type': 'application/json',
     },
-    timeout: 10000,
   });
 
-  if (!res.data.success) throw new Error(res.data.msg || 'Toggle failed');
-
-  console.log(`⚡ Tuya switch_1 => ${turnOn ? 'ON' : 'OFF'} by ${source}`);
+  lastKnownRelay = !!turnOn;
   await db.ref('control/lastAction').set({
-    turnOn: !!turnOn,
+    turnOn,
     source,
     at: admin.database.ServerValue.TIMESTAMP,
   });
+
+  console.log(`⚡ Relay ${turnOn ? 'ON' : 'OFF'} (${source})`);
 }
 
-// -----------------------------------------------------------
-// FIREBASE REFS
-// -----------------------------------------------------------
-const readingsRef = db.ref('readings');
-const statusRef = db.ref('status/current');
-const scheduleRef = db.ref('schedule');
-const commandRef = db.ref('control/command');
+// ----------------------------------------------------------
+// FIREBASE WATCHERS
+// ----------------------------------------------------------
 
-let lastKnownRelay = false;
-let scheduleConfig = null;
+db.ref('schedule').on('value', (s) => {
+  scheduleConfig = s.val();
+  console.log('🗓️ Schedule updated');
+});
 
-// Watch schedule config
-scheduleRef.on(
-  'value',
-  (snap) => {
-    scheduleConfig = snap.val();
-    console.log('🗓️ Schedule updated:', scheduleConfig);
-  },
-  (err) => console.error('Schedule watch error', err),
-);
+db.ref('control/command').on('value', async (s) => {
+  const cmd = s.val();
+  if (!cmd) return;
+  if (cmd.turnOn === lastKnownRelay) return;
+  await toggleRelay(cmd.turnOn, 'app');
+});
 
-// Watch manual commands (Flutter writes this)
-commandRef.on(
-  'value',
-  async (snap) => {
-    const cmd = snap.val();
-    if (!cmd) return;
+// ----------------------------------------------------------
+// SCHEDULE LOGIC
+// ----------------------------------------------------------
 
-    try {
-      const desired = !!cmd.turnOn;
-      await sendToggleCommand(desired, 'app');
-
-      // clear command so it won’t re-run
-      await commandRef.remove();
-
-      lastKnownRelay = desired;
-    } catch (err) {
-      console.error('Error handling manual command:', err.message || err);
-    }
-  },
-  (err) => console.error('Command watch error', err),
-);
-
-// -----------------------------------------------------------
-// POLL STATUS AND WRITE TO FIREBASE
-// -----------------------------------------------------------
-async function pollStatusAndSave() {
-  try {
-    const data = await getDeviceStatus();
-    lastKnownRelay = data.isOn;
-
-    const reading = {
-      voltage: data.voltage,
-      current: data.current,
-      power: data.power,
-      is_on: data.isOn,
-      load_on: data.loadOn,
-      timestamp: admin.database.ServerValue.TIMESTAMP,
-    };
-
-    await readingsRef.push(reading);
-    await statusRef.set({
-      ...reading,
-      deviceOnline: true,
-      lastError: null,
-    });
-
-    console.log(
-      `📥 V=${data.voltage.toFixed(1)}V I=${data.current.toFixed(3)}A P=${data.power.toFixed(
-        1,
-      )}W load_on=${data.loadOn}`,
-    );
-  } catch (err) {
-    console.error('pollStatus error:', err.message || err);
-
-    // mark offline so Flutter shows OFFLINE
-    await statusRef.set({
-      voltage: 0,
-      current: 0,
-      power: 0,
-      is_on: false,
-      load_on: false,
-      deviceOnline: false,
-      lastError: String(err.message || err),
-      timestamp: admin.database.ServerValue.TIMESTAMP,
-    });
-  }
-}
-
-// -----------------------------------------------------------
-// SCHEDULE ENFORCEMENT
-// -----------------------------------------------------------
 function isWithinSchedule(now, cfg) {
   if (!cfg || !cfg.isEnabled) return false;
+  if (!cfg.days?.[now.getDay()]) return false;
 
-  const days = Array.isArray(cfg.days) ? cfg.days : [];
-  const todayIndex = now.getDay(); // 0=Sun..6=Sat
-  if (!days[todayIndex]) return false;
+  const [sh, sm] = cfg.start.split(':').map(Number);
+  const [eh, em] = cfg.end.split(':').map(Number);
 
-  const start = typeof cfg.start === 'string' ? cfg.start : '08:00';
-  const end = typeof cfg.end === 'string' ? cfg.end : '21:00';
+  const nowM = now.getHours() * 60 + now.getMinutes();
+  const sM = sh * 60 + sm;
+  const eM = eh * 60 + em;
 
-  const [sh, sm] = start.split(':').map((x) => parseInt(x, 10));
-  const [eh, em] = end.split(':').map((x) => parseInt(x, 10));
-
-  const startMin = sh * 60 + sm;
-  const endMin = eh * 60 + em;
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-
-  if (startMin <= endMin) {
-    return nowMin >= startMin && nowMin < endMin;
-  } else {
-    return nowMin >= startMin || nowMin < endMin; // overnight
-  }
+  return sM <= eM
+    ? nowM >= sM && nowM < eM
+    : nowM >= sM || nowM < eM;
 }
 
 async function enforceSchedule() {
-  if (!scheduleConfig || !scheduleConfig.isEnabled) return;
-
-  try {
-    const now = new Date();
-    const shouldBeOn = isWithinSchedule(now, scheduleConfig);
-
-    if (shouldBeOn === lastKnownRelay) return;
-
-    await sendToggleCommand(shouldBeOn, 'schedule');
-    lastKnownRelay = shouldBeOn;
-
-    console.log(`🕒 Schedule enforced => ${shouldBeOn ? 'ON' : 'OFF'}`);
-  } catch (err) {
-    console.error('enforceSchedule error:', err.message || err);
+  if (!scheduleConfig?.isEnabled) return;
+  const shouldBeOn = isWithinSchedule(new Date(), scheduleConfig);
+  if (shouldBeOn !== lastKnownRelay) {
+    await toggleRelay(shouldBeOn, 'schedule');
   }
 }
 
-// -----------------------------------------------------------
-// MAIN
-// -----------------------------------------------------------
-(async function main() {
-  console.log('🚀 Power monitor backend starting (Mode A)...');
+// ----------------------------------------------------------
+// MAIN LOOP
+// ----------------------------------------------------------
+
+async function pollAndSave() {
   try {
-    await ensureToken();
+    const d = await getDeviceStatus();
+    lastKnownRelay = d.isOn;
+
+    const data = {
+      voltage: d.voltage,
+      current: d.current,
+      power: d.power,
+      is_on: d.isOn,
+      load_on: d.loadOn,
+      timestamp: admin.database.ServerValue.TIMESTAMP,
+    };
+
+    await db.ref('readings').push(data);
+    await db.ref('status/current').set({
+      ...data,
+      deviceOnline: true,
+    });
+
+    console.log(
+      `📥 ${d.voltage}V ${d.current}A ${d.power}W load=${d.loadOn}`,
+    );
   } catch (e) {
-    console.error('Initial token fetch failed:', e.message || e);
+    console.error('❌ Device offline');
+    await db.ref('status/current').update({
+      deviceOnline: false,
+      errorAt: admin.database.ServerValue.TIMESTAMP,
+    });
   }
+}
 
-  setInterval(pollStatusAndSave, POLL_MS);
-  setInterval(enforceSchedule, SCHEDULE_MS);
+// ----------------------------------------------------------
+// START
+// ----------------------------------------------------------
 
-  // immediate first run
-  pollStatusAndSave();
-})();
+console.log('🚀 Backend started (MODE A)');
+setInterval(pollAndSave, 60 * 1000);
+setInterval(enforceSchedule, 30 * 1000);
